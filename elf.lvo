@@ -1,0 +1,13 @@
+# elf.library 1.0's jump table, as OpenELF builds it: LVO, call, registers.
+# Our own API (README.md, "The API"): OS 4.1's elf.library is an interface,
+# not a jump table, so nothing here can match it byte for byte; the DL
+# calls follow dlopen's names and meaning, as OS 4.1's DLOpen, DLSym and
+# DLClose do.
+-30 ElfLoadSeg d1
+-36 ElfIdentify a0,d0
+-42 DLOpen a0,d0
+-48 DLSym a0,a1
+-54 DLClose a0
+-60 ElfHook d0
+-66 ElfLastError a0,d0
+-72 ElfErrorString d0
