@@ -36,12 +36,14 @@
 #define PT_DYNAMIC 2
 #define PT_INTERP 3
 #define PT_TLS 7
+#define PF_X 1
 
 #define DT_NULL 0
 #define DT_NEEDED 1
 #define DT_PLTRELSZ 2
 #define DT_HASH 4
 #define DT_STRTAB 5
+#define DT_STRSZ 10
 #define DT_SYMTAB 6
 #define DT_RELA 7
 #define DT_RELASZ 8
@@ -85,6 +87,8 @@
 #define RELA_SIZE 12
 #define REL_SIZE 8
 #define RELOC_CHUNK 32      /* relocations read at a time */
+#define MAX_ALIGN 4096      /* the most a section may ask */
+#define MAX_CTOR 8          /* constructor and destructor arrays a program may have */
 
 /* ---- Small helpers ------------------------------------------------------ */
 
@@ -178,6 +182,9 @@ struct ld {
     oe_u32 strsize;
     oe_u32 common;              /* ET_REL: where the COMMON symbols went */
     oe_u32 blo, bsize;          /* ET_EXEC, ET_DYN: the block's link address and size */
+    /* a program's constructors (ctor) and destructors (dtor), in order */
+    struct fnarr { oe_u32 at, n, key; } ctor[MAX_CTOR], dtor[MAX_CTOR];
+    oe_u32 nctor, ndtor;
 };
 
 /* len bytes at link address va lie inside the loaded block */
@@ -215,11 +222,15 @@ static const oe_u8 *shdr(struct ld *l, oe_u32 i) { return l->sh + i * SHDR_SIZE;
 #define ST_TYPE(s) ((s)[12] & 15)
 #define ST_SHNDX(s) g16((s) + 14)
 
-/* A new segment of size content bytes: its content's address, or 0. */
-static oe_u8 *newseg(struct ld *l, oe_u32 size)
+/* A new segment of size content bytes aligned to al (a power of two up to
+ * MAX_ALIGN): its content's address, or 0. The allocation is only taken to
+ * be 4-aligned, so above 4 it grows by al - 4 and the contents start where
+ * the alignment falls. */
+static oe_u8 *newseg(struct ld *l, oe_u32 size, oe_u32 al)
 {
     struct oe_image *img = l->img;
     oe_u8 *m;
+    if (al < 4) al = 4;
     if (img->nseg == img->segcap) {
         oe_u32 n = img->segcap ? img->segcap * 2 : 8;
         void **a = (void **)talloc(l, n * sizeof(void *));
@@ -232,12 +243,23 @@ static oe_u8 *newseg(struct ld *l, oe_u32 size)
         img->segcap = n;
     }
     if (size > 0x7fff0000UL) return 0;
-    size = (size + 8 + 7) & ~7UL;
+    size = (size + 8 + (al - 4) + 7) & ~7UL;
     m = (oe_u8 *)l->env->alloc(l->env, size, OE_MEM_SEGMENT);
     if (!m) return 0;
     p32(m, size);
     img->seg[img->nseg++] = m;
-    return m + 8;
+    return PTR((ADDR(m) + 8 + al - 1) & ~(al - 1));
+}
+
+/* addr is code or data in one of the image's segments */
+static int inimage(const struct oe_image *img, oe_u32 addr)
+{
+    oe_u32 i;
+    for (i = 0; i < img->nseg; i++) {
+        oe_u32 b = ADDR(img->seg[i]) + 8, n = g32((oe_u8 *)img->seg[i]) - 8;
+        if (addr >= b && addr - b < n) return 1;
+    }
+    return 0;
 }
 
 void oe_unload(struct oe_env *env, struct oe_image *img)
@@ -259,6 +281,15 @@ static int known(struct ld *l, oe_u32 type)
     if (type <= R_68K_PC8 || (type >= R_68K_PLT32 && type <= R_68K_PLT8)) return OE_OK;
     l->img->detail = type;
     return type >= R_68K_TLS_FIRST && type <= R_68K_TLS_LAST ? OE_ERR_TLS : OE_ERR_RELOC;
+}
+
+/* The bytes a relocation type changes */
+static oe_u32 relwidth(oe_u32 rt)
+{
+    if (rt == R_68K_NONE) return 0;
+    if (rt == R_68K_8 || rt == R_68K_PC8 || rt == R_68K_PLT8) return 1;
+    if (rt == R_68K_16 || rt == R_68K_PC16 || rt == R_68K_PLT16) return 2;
+    return 4;
 }
 
 /* Apply one relocation at P: S + A for the absolute kinds, minus P for the
@@ -417,14 +448,17 @@ static int rel_relocate(struct ld *l, oe_u32 ri)
         for (k = 0; k < n; k++) {
             const oe_u8 *q = buf + k * ent;
             oe_u32 where = g32(q), info = g32(q + 4), S, A, P, rt = info & 0xff;
-            if (where > size || size - where < (rt == R_68K_8 || rt == R_68K_PC8 ? 1u : rt == R_68K_16 || rt == R_68K_PC16 ? 2u : rt == R_68K_NONE ? 0u : 4u))
+            if (where > size || size - where < relwidth(rt))
                 return OE_ERR_FORMAT;
             P = M32(l->secaddr[target] + where);
             if (rt == R_68K_NONE) continue;
             if ((e = known(l, rt)) != OE_OK) return e;
             if ((e = rel_symval(l, info >> 8, &S)) != OE_OK) return e;
-            A = ent == RELA_SIZE ? g32(q + 8)
-              : rt == R_68K_32 || rt == R_68K_PC32 ? g32(PTR(P)) : 0;
+            /* SHT_REL keeps the addend at the place, as wide as the relocation */
+            if (ent == RELA_SIZE) A = g32(q + 8);
+            else if (relwidth(rt) == 4) A = g32(PTR(P));
+            else if (relwidth(rt) == 2) A = M32((g16(PTR(P)) ^ 0x8000UL) - 0x8000UL);
+            else A = M32((PTR(P)[0] ^ 0x80UL) - 0x80UL);
             if ((e = apply(l, rt, P, S, A)) != OE_OK) return e;
         }
     }
@@ -435,7 +469,7 @@ static int load_rel(struct ld *l)
 {
     struct oe_image *img = l->img;
     oe_u32 i, symtab = 0, seg_used = 0, seg_size = 0, first = 0, commsize = 0, commalign = 4;
-    oe_u32 *off;                /* each loaded section's offset in its segment, then its segment's number */
+    oe_u32 *off;                /* per index: a section's offset in its segment; a segment's size and alignment */
     int e;
     oe_u8 *base = 0;
     for (i = 1; i < l->shnum; i++)
@@ -448,7 +482,7 @@ static int load_rel(struct ld *l)
         oe_u8 *s = l->sym + i * SYM_SIZE;
         if (ST_SHNDX(s) == SHN_COMMON) {
             oe_u32 a = ST_VALUE(s) ? ST_VALUE(s) : 1;
-            if (a & (a - 1)) return OE_ERR_FORMAT;
+            if ((a & (a - 1)) || a > MAX_ALIGN) return OE_ERR_FORMAT;
             commsize = (commsize + a - 1) & ~(a - 1);
             if (a > commalign) commalign = a;
             p32(s + 4, commsize);
@@ -457,7 +491,7 @@ static int load_rel(struct ld *l)
     }
 
     if (!(l->secaddr = (oe_u32 *)talloc(l, (l->shnum + 1) * sizeof(oe_u32)))) return OE_ERR_NOMEM;
-    if (!(off = (oe_u32 *)talloc(l, (l->shnum + 1) * 2 * sizeof(oe_u32)))) return OE_ERR_NOMEM;
+    if (!(off = (oe_u32 *)talloc(l, (l->shnum + 1) * 3 * sizeof(oe_u32)))) return OE_ERR_NOMEM;
 
     /* Pass 1: which segment each section goes in. Section shnum stands for
      * the COMMON block. */
@@ -473,34 +507,36 @@ static int load_rel(struct ld *l)
             sz = commsize;
             al = commalign;
         }
-        if (al & (al - 1)) return OE_ERR_FORMAT;
-        if (al > 8) al = 8;     /* segments are 8-aligned; no 68k section asks more */
+        if ((al & (al - 1)) || al > MAX_ALIGN) { tfree(l, off, (l->shnum + 1) * 3 * sizeof(oe_u32)); return OE_ERR_FORMAT; }
         if (seg_size && l->env->seg_max && seg_size + al + sz > l->env->seg_max) {
-            off[2 * seg_used + 1] = seg_size;   /* reuse: segment sizes, below */
+            off[3 * seg_used + 1] = seg_size;
             seg_used++;
             seg_size = 0;
         }
+        if (al > off[3 * seg_used + 2]) off[3 * seg_used + 2] = al;
         seg_size = (seg_size + al - 1) & ~(al - 1);
-        off[2 * i] = seg_size;
+        off[3 * i] = seg_size;
         l->secaddr[i] = seg_used + 1;           /* its segment, 1-based, for now */
         seg_size += sz;
-        if (seg_size < sz) return OE_ERR_FORMAT;
+        if (seg_size < sz) { tfree(l, off, (l->shnum + 1) * 3 * sizeof(oe_u32)); return OE_ERR_FORMAT; }
     }
-    if (seg_size) off[2 * seg_used++ + 1] = seg_size;
-    if (!seg_used) return OE_ERR_FORMAT;
+    if (seg_size) off[3 * seg_used++ + 1] = seg_size;
+    if (!seg_used) { tfree(l, off, (l->shnum + 1) * 3 * sizeof(oe_u32)); return OE_ERR_FORMAT; }
 
     /* Pass 2: the segments, then each section's address */
     for (i = 0; i < seg_used; i++) {
-        oe_u8 *m = newseg(l, off[2 * i + 1]);
-        if (!m) return OE_ERR_NOMEM;
+        /* where each segment's contents start, kept in its size's place */
+        oe_u8 *m = newseg(l, off[3 * i + 1], off[3 * i + 2]);
+        if (!m) { tfree(l, off, (l->shnum + 1) * 3 * sizeof(oe_u32)); return OE_ERR_NOMEM; }
+        off[3 * i + 1] = ADDR(m);
         if (!base) base = m;
     }
     for (i = 1; i <= l->shnum; i++) {
         if (!l->secaddr[i]) continue;
-        l->secaddr[i] = ADDR((oe_u8 *)img->seg[l->secaddr[i] - 1] + 8) + off[2 * i];
+        l->secaddr[i] = off[3 * (l->secaddr[i] - 1) + 1] + off[3 * i];
     }
     l->common = l->secaddr[l->shnum];
-    tfree(l, off, (l->shnum + 1) * 2 * sizeof(oe_u32));
+    tfree(l, off, (l->shnum + 1) * 3 * sizeof(oe_u32));
 
     /* Pass 3: contents (NOBITS stay cleared) */
     for (i = 1; i < l->shnum; i++) {
@@ -544,9 +580,9 @@ static int load_rel(struct ld *l)
 static int load_block(struct ld *l, oe_u8 **phbuf, oe_u32 *lo_out)
 {
     struct oe_image *img = l->img;
-    oe_u32 i, lo = 0xffffffffUL, hi = 0, nload = 0;
+    oe_u32 i, lo = 0xffffffffUL, hi = 0, nload = 0, al = 4, entry = g32(l->eh + 24);
     oe_u8 *ph, *base;
-    int e;
+    int e, entry_ok = 0;
     if (!l->phnum || l->phnum > 1024) return OE_ERR_FORMAT;
     if (!(ph = (oe_u8 *)talloc(l, l->phnum * PHDR_SIZE))) return OE_ERR_NOMEM;
     *phbuf = ph;
@@ -558,14 +594,25 @@ static int load_block(struct ld *l, oe_u8 **phbuf, oe_u32 *lo_out)
         if (t == PT_TLS) return OE_ERR_TLS;
         if (t != PT_LOAD || msz == 0) continue;
         if (fsz > msz || va + msz < va) return OE_ERR_FORMAT;
+        if ((g32(p + 24) & PF_X) && entry >= va && entry - va < fsz) entry_ok = 1;
         if (va < lo) lo = va;
         if (va + msz > hi) hi = va + msz;
         nload++;
     }
     if (!nload) return OE_ERR_FORMAT;
-    lo &= ~7UL;
+    /* a program starts in code it loaded (a shared object may have no entry) */
+    if (!entry_ok && (entry || img->type == ET_EXEC)) return OE_ERR_FORMAT;
+    /* the block keeps the alignment its sections ask: the bias is a multiple of it */
+    for (i = 1; i < l->shnum; i++) {
+        const oe_u8 *s = shdr(l, i);
+        oe_u32 a = SH_ALIGN(s);
+        if (!(SH_FLAGS(s) & SHF_ALLOC) || a <= al) continue;
+        if ((a & (a - 1)) || a > MAX_ALIGN) return OE_ERR_FORMAT;
+        al = a;
+    }
+    lo &= ~(al - 1);
     if (hi - lo > 0x7fffffffUL) return OE_ERR_FORMAT;
-    if (!(base = newseg(l, hi - lo))) return OE_ERR_NOMEM;
+    if (!(base = newseg(l, hi - lo, al))) return OE_ERR_NOMEM;
     for (i = 0; i < l->phnum; i++) {
         const oe_u8 *p = ph + i * PHDR_SIZE;
         if (g32(p) != PT_LOAD || g32(p + 20) == 0) continue;
@@ -620,7 +667,12 @@ static int load_exec(struct ld *l)
                 if (si >= l->nsym) return OE_ERR_FORMAT;
                 s = l->sym + si * SYM_SIZE;
                 shndx = ST_SHNDX(s);
-                /* absolute symbols, and weak ones nobody defined, don't move */
+                /* absolute symbols, and weak ones nobody defined, don't move;
+                 * a strong one nobody defined is a hole in the program */
+                if (shndx == SHN_UNDEF && si != 0 && ST_BIND(s) != STB_WEAK) {
+                    setname(img, symname(l, s));
+                    return OE_ERR_UNDEF;
+                }
                 if (shndx == SHN_ABS || (shndx == SHN_UNDEF && si != 0)) continue;
                 if (ST_TYPE(s) == STT_TLS) return OE_ERR_TLS;
                 if (where < tlo || where + 4 > thi || !inblock(l, where, 4)) return OE_ERR_FORMAT;
@@ -643,7 +695,7 @@ static int load_exec(struct ld *l)
 
 /* ET_DYN: the dynamic section's relocations */
 struct dyn {
-    oe_u32 rela, relasz, jmprel, pltrelsz, symtab, strtab, hash, gnuhash;
+    oe_u32 rela, relasz, jmprel, pltrelsz, symtab, strtab, strsz, hash, gnuhash;
 };
 
 /* How many dynamic symbols there are, from either hash table; 0 when the
@@ -679,10 +731,11 @@ static oe_u32 dyn_nsym(const struct ld *l, const struct dyn *d)
     return n;
 }
 
-/* A string in the dynamic string table, or "" when it lies outside */
+/* A string in the dynamic string table, or "" when it lies outside (the
+ * table was checked to end in a NUL, so every string in it ends there) */
 static const char *dyn_str(const struct ld *l, const struct dyn *d, oe_u32 off)
 {
-    if (!inblock(l, d->strtab + off, 1)) return "";
+    if (off >= d->strsz) return "";
     return (const char *)PTR(M32(d->strtab + off + l->img->bias));
 }
 
@@ -712,13 +765,21 @@ static int dyn_relocs(struct ld *l, const struct dyn *d, oe_u32 at, oe_u32 sz)
         if (rt == R_68K_NONE) continue;
         if (!inblock(l, g32(r), 4)) return OE_ERR_FORMAT;
         if (rt == R_68K_RELATIVE) { p32(PTR(P), M32(img->bias + A)); continue; }
-        if ((e = dyn_symval(l, d, info >> 8, &S, &size)) != OE_OK) return e;
-        if (rt == R_68K_GLOB_DAT || rt == R_68K_JMP_SLOT) { p32(PTR(P), M32(S + A)); continue; }
         if (rt == R_68K_COPY) {
+            /* the symbol is defined here, at P: its contents come from the
+             * shared object that also defines it */
+            oe_u32 si = info >> 8;
+            const oe_u8 *s;
+            if (si == 0 || si >= img->nsym) return OE_ERR_FORMAT;
+            s = PTR(M32(d->symtab + img->bias)) + si * SYM_SIZE;
+            size = ST_SIZE(s);
             if (!inblock(l, g32(r), size)) return OE_ERR_FORMAT;
-            if (S) mcopy(PTR(P), PTR(S), size);
+            if ((e = resolve(l, dyn_str(l, d, ST_NAME(s)), 0, &S)) != OE_OK) return e;
+            mcopy(PTR(P), PTR(S), size);
             continue;
         }
+        if ((e = dyn_symval(l, d, info >> 8, &S, &size)) != OE_OK) return e;
+        if (rt == R_68K_GLOB_DAT || rt == R_68K_JMP_SLOT) { p32(PTR(P), M32(S + A)); continue; }
         if ((e = apply(l, rt, P, S, A)) != OE_OK) return e;
     }
     return OE_OK;
@@ -757,6 +818,7 @@ static int load_dyn(struct ld *l)
         case DT_PLTREL: if (v != DT_RELA) return OE_ERR_FORMAT; break;
         case DT_SYMTAB: d.symtab = v; break;
         case DT_STRTAB: d.strtab = v; break;
+        case DT_STRSZ: d.strsz = v; break;
         case DT_HASH: d.hash = v; break;
         case DT_GNU_HASH: d.gnuhash = v; break;
         case DT_INIT: img->init = M32(v + img->bias); break;
@@ -769,11 +831,23 @@ static int load_dyn(struct ld *l)
         case DT_PREINIT_ARRAYSZ: img->preinit_count = v / 4; break;
         }
     }
+    if (d.strtab && (!d.strsz || !inblock(l, d.strtab, d.strsz)
+                     || *PTR(M32(d.strtab + d.strsz - 1 + img->bias)) != 0))
+        return OE_ERR_FORMAT;
+    /* the constructors and destructors lie in the block */
+    if (img->init_count > l->bsize / 4 || img->fini_count > l->bsize / 4 || img->preinit_count > l->bsize / 4
+        || (img->init && !inblock(l, M32(img->init - img->bias), 2))
+        || (img->fini && !inblock(l, M32(img->fini - img->bias), 2))
+        || (img->init_count && !inblock(l, M32(img->init_array - img->bias), img->init_count * 4))
+        || (img->fini_count && !inblock(l, M32(img->fini_array - img->bias), img->fini_count * 4))
+        || (img->preinit_count && !inblock(l, M32(img->preinit_array - img->bias), img->preinit_count * 4)))
+        return OE_ERR_FORMAT;
     img->nsym = d.symtab ? dyn_nsym(l, &d) : 0;
     if (d.symtab && !d.strtab) return OE_ERR_FORMAT;
     if (img->nsym) {
         img->dynsym = M32(d.symtab + img->bias);
         img->dynstr = M32(d.strtab + img->bias);
+        img->dynstrsz = d.strsz;
         img->hash = d.hash ? M32(d.hash + img->bias) : 0;
     }
 
@@ -789,6 +863,135 @@ static int load_dyn(struct ld *l)
     if ((d.relasz || d.pltrelsz) && !d.symtab) return OE_ERR_FORMAT;
     if (d.rela && (e = dyn_relocs(l, &d, d.rela, d.relasz)) != OE_OK) return e;
     if (d.jmprel && (e = dyn_relocs(l, &d, d.jmprel, d.pltrelsz)) != OE_OK) return e;
+    return OE_OK;
+}
+
+/* ---- A program's start routine ------------------------------------------ */
+
+/* The priority in an array section's name: .init_array.00101 is 101, and
+ * a plain .init_array runs after every numbered one */
+static oe_u32 secpri(const char *name)
+{
+    oe_u32 v = 0;
+    const char *p;
+    if (!name[0]) return 0x10000UL;
+    for (p = name + 1; *p && *p != '.'; p++) ;
+    if (!*p || !p[1]) return 0x10000UL;
+    for (p++; *p; p++) {
+        if (*p < '0' || *p > '9' || v > 0xffff) return 0x10000UL;
+        v = v * 10 + (oe_u32)(*p - '0');
+    }
+    return v;
+}
+
+/* n function pointers at at, or with n 0 the one function at at, into the
+ * constructor or destructor list, kept in key order */
+static int addfn(struct ld *l, int dtor, oe_u32 at, oe_u32 n, oe_u32 key)
+{
+    struct fnarr *a = dtor ? l->dtor : l->ctor;
+    oe_u32 *cnt = dtor ? &l->ndtor : &l->nctor, i;
+    if (*cnt == MAX_CTOR) return OE_ERR_FORMAT;
+    for (i = *cnt; i > 0 && a[i - 1].key > key; i--)
+        a[i].at = a[i - 1].at, a[i].n = a[i - 1].n, a[i].key = a[i - 1].key;   /* no memcpy in the library */
+    a[i].at = at;
+    a[i].n = n;
+    a[i].key = key;
+    (*cnt)++;
+    return OE_OK;
+}
+
+/* Constructors come in order preinit, DT_INIT, init; destructors run
+ * backwards through fini then DT_FINI. Objects and executables: from their
+ * array sections (an object's numbered ones apart, ordered by number). */
+static int collect_sections(struct ld *l)
+{
+    oe_u32 i, sx = g16(l->eh + 50), nsz = 0;
+    char *names = 0;
+    int e = OE_OK;
+    if (sx == SHN_XINDEX && l->shnum) sx = SH_LINK(shdr(l, 0));
+    if (sx && sx < l->shnum) {
+        nsz = SH_SIZE(shdr(l, sx));
+        if (nsz > 0x100000UL) return OE_ERR_FORMAT;
+        if (!(names = (char *)talloc(l, nsz + 1))) return OE_ERR_NOMEM;
+        e = rd(l, SH_OFFSET(shdr(l, sx)), names, nsz);
+    }
+    for (i = 1; e == OE_OK && i < l->shnum; i++) {
+        const oe_u8 *s = shdr(l, i);
+        oe_u32 t = SH_TYPE(s), n = SH_SIZE(s) / 4, at, pri;
+        if ((t != SHT_INIT_ARRAY && t != SHT_FINI_ARRAY && t != SHT_PREINIT_ARRAY) || !(SH_FLAGS(s) & SHF_ALLOC) || !n)
+            continue;
+        if (l->img->type == ET_REL) {
+            if (!(at = l->secaddr[i])) continue;
+        } else {
+            if (!inblock(l, SH_ADDR(s), n * 4)) { e = OE_ERR_FORMAT; break; }
+            at = M32(SH_ADDR(s) + l->img->bias);
+        }
+        pri = names && SH_NAME(s) < nsz ? secpri(names + SH_NAME(s)) : 0x10000UL;
+        if (t == SHT_PREINIT_ARRAY) e = addfn(l, 0, at, n, pri);
+        else if (t == SHT_INIT_ARRAY) e = addfn(l, 0, at, n, 0x20000UL + pri);
+        else e = addfn(l, 1, at, n, 1 + pri);
+    }
+    if (names) tfree(l, names, nsz + 1);
+    return e;
+}
+
+/* Shared objects and PIEs: from the dynamic section */
+static int collect_dyn(struct ld *l)
+{
+    struct oe_image *img = l->img;
+    int e = OE_OK;
+    if (img->preinit_count) e = addfn(l, 0, img->preinit_array, img->preinit_count, 0);
+    if (e == OE_OK && img->init) e = addfn(l, 0, img->init, 0, 0x18000UL);
+    if (e == OE_OK && img->init_count) e = addfn(l, 0, img->init_array, img->init_count, 0x20000UL);
+    if (e == OE_OK && img->fini) e = addfn(l, 1, img->fini, 0, 0);
+    if (e == OE_OK && img->fini_count) e = addfn(l, 1, img->fini_array, img->fini_count, 1);
+    return e;
+}
+
+/* A jsr to each function in the list (backwards for destructors), written
+ * at *q when it is not 0; *count counts them. 0 and -1 are skipped. */
+static int emit(const struct oe_image *img, const struct fnarr *a, oe_u32 na, int back, oe_u8 **q, oe_u32 *count)
+{
+    oe_u32 k, i;
+    for (k = 0; k < na; k++) {
+        const struct fnarr *f = &a[back ? na - 1 - k : k];
+        oe_u32 n = f->n ? f->n : 1;
+        for (i = 0; i < n; i++) {
+            oe_u32 fn = f->n ? g32(PTR(f->at) + 4 * (back ? n - 1 - i : i)) : f->at;
+            if (fn == 0 || fn == 0xffffffffUL) continue;
+            if (!inimage(img, fn)) return OE_ERR_FORMAT;
+            if (*q) { p16(*q, 0x4eb9); p32(*q + 2, fn); *q += 6; }   /* jsr fn.l */
+            (*count)++;
+        }
+    }
+    return OE_OK;
+}
+
+/* A program with constructors or destructors starts in a routine of its
+ * own, in a segment of its own: constructors, the entry with D0 and A0 as
+ * they came, destructors, and the entry's D0 back. */
+static int start_routine(struct ld *l)
+{
+    struct oe_image *img = l->img;
+    oe_u32 nc = 0, nd = 0;
+    oe_u8 *q = 0, *w;
+    int e = img->type == ET_DYN ? collect_dyn(l) : collect_sections(l);
+    if (e == OE_OK) e = emit(img, l->ctor, l->nctor, 0, &q, &nc);
+    if (e == OE_OK) e = emit(img, l->dtor, l->ndtor, 1, &q, &nd);
+    if (e != OE_OK || nc + nd == 0) return e;
+    if (!(w = q = newseg(l, 20 + 6 * (nc + nd), 4))) return OE_ERR_NOMEM;
+    p32(q, 0x48e78080UL);                       /* movem.l d0/a0,-(sp) */
+    q += 4;
+    emit(img, l->ctor, l->nctor, 0, &q, &nc);
+    p32(q, 0x4cdf0101UL);                       /* movem.l (sp)+,d0/a0 */
+    p16(q + 4, 0x4eb9);                         /* jsr entry.l */
+    p32(q + 6, img->entry);
+    p16(q + 10, 0x2f00);                        /* move.l d0,-(sp) */
+    q += 12;
+    emit(img, l->dtor, l->ndtor, 1, &q, &nd);
+    p16(q, 0x201f);                             /* move.l (sp)+,d0 */
+    p16(q + 2, 0x4e75);                         /* rts */
+    img->entry = ADDR(w);
     return OE_OK;
 }
 
@@ -817,6 +1020,7 @@ static int load_once(struct oe_env *env, struct oe_image *img)
         else if (img->type == ET_EXEC) e = load_exec(&l);
         else e = load_dyn(&l);
     }
+    if (e == OE_OK && env->program && img->entry) e = start_routine(&l);
     cleanup(&l);
     if (e != OE_OK) {
         oe_u32 detail = img->detail;
@@ -861,9 +1065,10 @@ oe_u32 oe_lookup(const struct oe_image *img, const char *name)
             hv &= ~g;
             hv = M32(hv);
         }
-        for (i = g32(h + 8 + (hv % nb) * 4); i && i < img->nsym; i = g32(h + 8 + nb * 4 + i * 4)) {
+        oe_u32 steps = 0;
+        for (i = g32(h + 8 + (hv % nb) * 4); i && i < img->nsym && steps++ < img->nsym; i = g32(h + 8 + nb * 4 + i * 4)) {
             const oe_u8 *s = PTR(img->dynsym) + i * SYM_SIZE;
-            if (ST_SHNDX(s) != SHN_UNDEF && ST_BIND(s) != STB_LOCAL
+            if (ST_SHNDX(s) != SHN_UNDEF && ST_BIND(s) != STB_LOCAL && ST_NAME(s) < img->dynstrsz
                 && streq((const char *)PTR(img->dynstr + ST_NAME(s)), name))
                 return ST_SHNDX(s) == SHN_ABS ? ST_VALUE(s) : M32(ST_VALUE(s) + img->bias);
         }
@@ -871,7 +1076,7 @@ oe_u32 oe_lookup(const struct oe_image *img, const char *name)
     }
     for (i = 1; i < img->nsym; i++) {
         const oe_u8 *s = PTR(img->dynsym) + i * SYM_SIZE;
-        if (ST_SHNDX(s) != SHN_UNDEF && ST_BIND(s) != STB_LOCAL
+        if (ST_SHNDX(s) != SHN_UNDEF && ST_BIND(s) != STB_LOCAL && ST_NAME(s) < img->dynstrsz
             && streq((const char *)PTR(img->dynstr + ST_NAME(s)), name))
             return ST_SHNDX(s) == SHN_ABS ? ST_VALUE(s) : M32(ST_VALUE(s) + img->bias);
     }

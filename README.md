@@ -14,7 +14,7 @@ runs.
 
 | File | What it is |
 | --- | --- |
-| `elf_core.c`, `.h` | The loader, plain C, no Amiga headers (7.9 KB at -Os): `ET_REL` objects (AROS and MorphOS load programs this way) with their sections packed into segments of at most 32 KB so they fit fragmented memory; `ET_EXEC` executables linked with their relocations kept (`ld -q`); `ET_DYN` shared objects and PIEs with their dynamic relocations, `DT_NEEDED`, constructors and destructors. It refuses, with a reason, what it can't load: other CPUs, Linux programs (`PT_INTERP`), thread-local storage, `-fpic` objects (GOT relocations), executables with no relocations. |
+| `elf_core.c`, `.h` | The loader, plain C, no Amiga headers (10.0 KB at -Os): `ET_REL` objects (AROS and MorphOS load programs this way) with their sections packed into segments of at most 32 KB so they fit fragmented memory; `ET_EXEC` executables linked with their relocations kept (`ld -q`); `ET_DYN` shared objects and PIEs with their dynamic relocations, `DT_NEEDED`, constructors and destructors. Sections keep the alignment they ask (up to 4 KB). A program with constructors or destructors gets a start routine of its own: preinit, init (an object's numbered `.init_array.N` sections in order), the program's entry with D0 and A0 as they came, then the destructors the other way. It refuses, with a reason, what it can't load: other CPUs, Linux programs (`PT_INTERP`), thread-local storage, `-fpic` objects (GOT relocations), executables with no relocations, executables with a symbol nothing defines or an entry outside their code. |
 | `openelf_lib.c`, `openelf_stubs.S` | The library: RomTag, jump table, AllocMem, the file through DOS, shared objects kept by name, the LoadSeg hook. |
 | `openelf_amiga.h` | The Exec and DOS facts the library uses, in our own words, so it builds with no NDK. |
 | `openelf_public.h`, `elf.lvo` | The calls, LVO by LVO. |
@@ -45,6 +45,9 @@ runs.
 CreateProc run it). `DLOpen` finds a name with no path in `LIBS:elf/` and
 then the current directory, opens its `DT_NEEDED` first, binds every symbol
 at once (`RTLD_NOW`; every object is global) and runs its constructors.
+Objects that need each other round a cycle are refused, as is one that needs
+more than 16. `DLSym` on a handle looks in that object and then in what it
+needs.
 OS 4.1's elf.library is an interface, not a jump table, so no 68k library
 can match it byte for byte; the DL calls keep its names and dlopen's
 meaning, so source that uses them ports by changing how the library is
@@ -92,8 +95,12 @@ either.
   every allocation counted.
 - `tests/m68k/test_openelf_vamos.sh`: the built `elf.library` in amitools'
   vamos (68040): the examples run from `ElfTest`, `libgreet.so` through
-  DLOpen, and a hunk file refused.
+  DLOpen, `greet_answer` found through `libouter.so`, which needs it, a
+  cycle of shared objects refused, and a hunk file refused.
 - CI: `.github/workflows/check-openelf.yml`.
 
-Not yet seen on a real OS 3.2.3: the LoadSeg hook from the Shell and
-Workbench (vamos has its own LoadSeg), which is the lab on the dev machine.
+Seen on a real OS 3.2.3 (22 October 2026, a copy of Instance-23, Kick
+47.115): `ElfHook` on, the three C examples run from the Shell, `DLOpen` of
+`libgreet.so` returns 42, a text file is still "not executable", and
+`ElfHook OFF` turns it off; the library takes 12.6 KB of fast RAM. Not yet
+seen: starting an ELF program from a Workbench icon.

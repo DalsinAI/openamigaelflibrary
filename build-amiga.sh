@@ -66,6 +66,7 @@ cc -c "$HERE/crt/amiga_shim.c" -o "$OBJ/shim.o"
 "$CC" $CFLAGS -fPIC -shared -nostdlib -Wl,--hash-style=both -Wl,--build-id=none -Wl,--no-warn-rwx-segments \
   -Wl,-z,max-page-size=16 -Wl,-z,common-page-size=16 -Wl,-z,norelro "$HERE/examples/greet.c" -o "$OUT/ELF/libgreet.so"
 
+rm -f "$OUT/ELF/rust-hello"    # never a stale one from an earlier build
 if command -v cargo >/dev/null && [ -d "$(rustc --print sysroot 2>/dev/null)/lib/rustlib/src/rust/library/alloc" ]; then
   ( cd "$HERE/rust/hello" && RUSTC_BOOTSTRAP=1 RUSTFLAGS="-C target-cpu=M68040" \
       cargo build -q --release --target m68k-unknown-none-elf \

@@ -83,12 +83,15 @@ static oe_s32 t_read(struct oe_env *env, oe_u32 off, void *buf, oe_u32 len)
 
 static int host_add(int a, int b) { return a + b; }
 static int host_hello(const char *s) { return (int)strlen(s) + 40; }
+static int notes;                       /* ctor.c's destructors, in the order they ran */
+static void host_note(int v) { notes = notes * 10 + v; }
 
 static oe_u32 t_resolve(struct oe_env *env, const char *name, int *found)
 {
     int i;
     (void)env;
     if (!strcmp(name, "host_add")) { *found = 1; return (oe_u32)(unsigned long)host_add; }
+    if (!strcmp(name, "host_note")) { *found = 1; return (oe_u32)(unsigned long)host_note; }
     for (i = 0; i < nlibs; i++) {
         oe_u32 a = oe_lookup(&libs[i], name);
         if (a) { *found = 1; return a; }
@@ -135,8 +138,9 @@ static void unload_libs(void)
     }
 }
 
-/* Load DIR/name and run its entry: it must return FX_ALL */
-static void run(const char *dir, const char *name, oe_u32 seg_max, int want_type, int min_segs)
+/* Load DIR/name as a program and run its entry: it must return FX_ALL.
+ * 1 when it was there to run. */
+static int run(const char *dir, const char *name, oe_u32 seg_max, int want_type, int min_segs)
 {
     struct tenv t;
     struct oe_image img;
@@ -144,8 +148,9 @@ static void run(const char *dir, const char *name, oe_u32 seg_max, int want_type
     int e;
     env_init(&t, dir);
     t.env.seg_max = seg_max;
+    t.env.program = 1;
     snprintf(path, sizeof path, "%s/%s", dir, name);
-    if (read_file(path, &t.f)) { printf("skipped %s: not built\n", name); return; }
+    if (read_file(path, &t.f)) { printf("skipped %s: not built\n", name); return 0; }
     e = oe_load(&t.env, &img);
     CHECK(e == OE_OK, "%s: %s (detail %lu, name %s)", name, oe_strerror(e), (unsigned long)img.detail, img.name);
     if (e == OE_OK) {
@@ -155,7 +160,11 @@ static void run(const char *dir, const char *name, oe_u32 seg_max, int want_type
         CHECK(img.type == want_type, "%s: type %d, want %d", name, img.type, want_type);
         CHECK((int)img.nseg >= min_segs, "%s: %lu segments, want at least %d", name, (unsigned long)img.nseg, min_segs);
         CHECK(img.entry != 0, "%s: no entry", name);
-        __builtin___clear_cache((char *)img.seg[0], (char *)img.seg[0] + 8);
+        {
+            oe_u32 i;
+            for (i = 0; i < img.nseg; i++)
+                __builtin___clear_cache((char *)img.seg[i], (char *)img.seg[i] + *(oe_u32 *)img.seg[i]);
+        }
         got = img.entry ? entry(&api) : 0;
         CHECK(got == FX_ALL, "%s: checks %#x, want %#x", name, got, FX_ALL);
         printf("%-22s seg_max %-5lu %2lu segment(s), %6lu bytes, checks %#x\n", name, (unsigned long)seg_max,
@@ -165,6 +174,16 @@ static void run(const char *dir, const char *name, oe_u32 seg_max, int want_type
     unload_libs();
     CHECK(t.live == 0, "%s: %ld allocations left", name, t.live);
     free(t.f.data);
+    return 1;
+}
+
+/* A program with constructors (ctor.c): it checks their order and its
+ * aligned data itself; its destructors must have run, the other way */
+static void run_ctor(const char *dir, const char *name, oe_u32 seg_max, int want_type, int imports)
+{
+    notes = 0;
+    if (run(dir, name, seg_max, want_type, 1) && imports)
+        CHECK(notes == 31, "%s: destructors ran as %d, want 31", name, notes);
 }
 
 /* Load DIR/name: it must be refused with want */
@@ -257,6 +276,12 @@ int main(int argc, char **argv)
     run(d, "prog-clang-exec-q", 0, 2, 1);
     run(d, "prog-pie", 0, 3, 1);
     run(d, "main.so", 0, 3, 1);               /* needs libfix.so */
+    /* constructors and destructors in a start routine, data aligned to 32 */
+    run_ctor(d, "ctor.o", 0, 1, 1);
+    run_ctor(d, "ctor.o", 16, 1, 1);          /* every section a segment of its own */
+    run_ctor(d, "ctor-r.o", 0, 1, 1);
+    run_ctor(d, "ctor-exec-q", 0, 2, 0);      /* an executable imports nothing */
+    run_ctor(d, "ctor-pie", 0, 3, 1);
     /* what it must refuse */
     refuse(d, "prog-exec-fixed", OE_ERR_FIXED);
     refuse(d, "prog-pic.o", OE_ERR_RELOC);
@@ -264,6 +289,8 @@ int main(int argc, char **argv)
     refuse(d, "linux-dynamic", OE_ERR_INTERP);
     refuse(d, "host-x86", OE_ERR_MACHINE);
     refuse(d, "prog-undef.o", OE_ERR_UNDEF);
+    refuse(d, "prog-exec-undef", OE_ERR_UNDEF);
+    refuse(d, "prog-exec-badentry", OE_ERR_FORMAT);
     refuse(d, "needs-missing.so", OE_ERR_NEEDED);
     refuse(d, "not-elf.txt", OE_ERR_NOT_ELF);
     /* damaged files */
@@ -273,6 +300,9 @@ int main(int argc, char **argv)
     damage(d, "prog-exec-q");
     damage(d, "prog-pie");
     damage(d, "main.so");
+    damage(d, "ctor-r.o");
+    damage(d, "ctor-exec-q");
+    damage(d, "ctor-pie");
     if (failures) { printf("%d failure(s)\n", failures); return 1; }
     printf("all passed\n");
     return 0;

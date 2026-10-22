@@ -40,7 +40,7 @@ typedef long oe_s32;
 enum oe_mem { OE_MEM_SEGMENT = 0, OE_MEM_TEMP = 1 };
 
 struct oe_env {
-    /* size bytes, cleared, at least 8-byte aligned; NULL when there is none */
+    /* size bytes, cleared, at least 4-byte aligned; NULL when there is none */
     void *(*alloc)(struct oe_env *env, oe_u32 size, enum oe_mem kind);
     void (*free)(struct oe_env *env, void *mem, oe_u32 size, enum oe_mem kind);
     /* len bytes at offset of the file into buf: 0, or -1 on any shortfall */
@@ -52,6 +52,10 @@ struct oe_env {
      * oe_error; NULL accepts every name */
     int (*needed)(struct oe_env *env, const char *name);
     oe_u32 seg_max;             /* ET_REL: most bytes of sections per segment, 0 = one segment */
+    /* 1 for a program: when it has constructors or destructors, entry is a
+     * start routine the core adds that runs the constructors, calls the
+     * program's own entry (D0 and A0 kept) and runs the destructors after */
+    int program;
     void *user;
 };
 
@@ -94,7 +98,7 @@ struct oe_image {
     oe_u32 entry;               /* where a program starts, 0 for none */
     oe_u32 bias;                /* ET_EXEC, ET_DYN: load address minus link address */
     /* ET_DYN: the dynamic symbols, in the loaded image, for oe_lookup */
-    oe_u32 dynsym, dynstr, nsym, hash;
+    oe_u32 dynsym, dynstr, dynstrsz, nsym, hash;
     /* constructors and destructors: DT_INIT/DT_FINI and the arrays */
     oe_u32 init, fini, init_array, init_count, fini_array, fini_count, preinit_array, preinit_count;
     /* why a load failed */

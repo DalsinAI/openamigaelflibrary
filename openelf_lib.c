@@ -26,11 +26,12 @@
 #define LIB_VERSION 1
 #define LIB_REVISION 0
 #define SEG_MAX (32UL * 1024)   /* ET_REL: sections per segment, for fragmented memory */
-#define MAX_DEPS 8
+#define MAX_DEPS 16
 
 struct dl {
     struct dl *next;
     ULONG refs;
+    ULONG loading;              /* listed while it loads, so a DT_NEEDED cycle is seen */
     struct oe_image img;
     struct dl *deps[MAX_DEPS];
     ULONG ndeps;
@@ -109,7 +110,9 @@ static oe_u32 e_resolve(struct oe_env *env, const char *name, int *found)
     struct dl *d;
     (void)env;
     for (d = ElfBase->dls; d; d = d->next) {
-        oe_u32 a = oe_lookup(&d->img, name);
+        oe_u32 a;
+        if (d->loading) continue;
+        a = oe_lookup(&d->img, name);
         if (a) { *found = 1; return a; }
     }
     return 0;
@@ -121,9 +124,10 @@ static int e_needed(struct oe_env *env, const char *name)
 {
     struct fenv *f = (struct fenv *)env;
     int err = OE_OK;
-    struct dl *d = dlopen_locked(name, &err);
-    if (!d) return err ? err : OE_ERR_NEEDED;
-    if (f->owner && f->owner->ndeps < MAX_DEPS) f->owner->deps[f->owner->ndeps++] = d;
+    struct dl *d;
+    if (f->owner && f->owner->ndeps == MAX_DEPS) return OE_ERR_NEEDED;    /* more than it can keep */
+    if (!(d = dlopen_locked(name, &err))) return err ? err : OE_ERR_NEEDED;
+    if (f->owner) f->owner->deps[f->owner->ndeps++] = d;
     /* a program's needs stay open: its seglist has nowhere to keep them */
     return OE_OK;
 }
@@ -139,6 +143,7 @@ static void env_init(struct fenv *f, BPTR fh, struct dl *owner)
     f->env.resolve = e_resolve;
     f->env.needed = e_needed;
     f->env.seg_max = SEG_MAX;
+    f->env.program = !owner;    /* a program's constructors run in its start routine */
     f->fh = fh;
     f->owner = owner;
 }
@@ -185,7 +190,7 @@ static BPTR loadseg_fh(BPTR fh, int *errp)
     ObtainSemaphore(&ElfBase->sem);
     env_init(&f, fh, 0);
     e = oe_load(&f.env, &img);
-    if (e == OE_OK && !img.entry) e = OE_ERR_TYPE;      /* a shared object with no entry */
+    if (e == OE_OK && !img.entry) { oe_unload(&f.env, &img); e = OE_ERR_TYPE; }    /* a shared object with no entry */
     if (e == OE_OK) {
         UBYTE *stub = 0;
         if (img.entry != (ULONG)img.seg[0] + 8) {
@@ -250,16 +255,21 @@ static struct dl *dl_find(const char *name)
     return 0;
 }
 
-static void dl_release(struct dl *d)
+static void dl_unlist(struct dl *d)
 {
     struct dl **pp;
+    for (pp = &ElfBase->dls; *pp; pp = &(*pp)->next)
+        if (*pp == d) { *pp = d->next; break; }
+}
+
+static void dl_release(struct dl *d)
+{
     ULONG i;
     struct fenv f;
     if (--d->refs) return;
     run_array(d->img.fini_array, d->img.fini_count, 1);
     if (d->img.fini) ((vfn)d->img.fini)();
-    for (pp = &ElfBase->dls; *pp; pp = &(*pp)->next)
-        if (*pp == d) { *pp = d->next; break; }
+    dl_unlist(d);
     env_init(&f, 0, 0);
     oe_unload(&f.env, &d->img);
     for (i = 0; i < d->ndeps; i++) dl_release(d->deps[i]);
@@ -289,6 +299,7 @@ static struct dl *dlopen_locked(const char *name, int *err)
     ULONG size;
     BPTR fh;
     int e;
+    if (d && d->loading) { *err = OE_ERR_NEEDED; return 0; }    /* it needs itself, round a cycle */
     if (d) { d->refs++; return d; }
     size = (sizeof *d + slen(name) + 4) & ~3UL;
     if (!(d = AllocMem(size, MEMF_ANY | MEMF_CLEAR))) { *err = OE_ERR_NOMEM; return 0; }
@@ -296,20 +307,23 @@ static struct dl *dlopen_locked(const char *name, int *err)
     scopy(d->name, name, slen(name) + 1);
     if (!(fh = dl_openfile(name))) { FreeMem(d, size); *err = OE_ERR_NEEDED; return 0; }
     env_init(&f, fh, d);
+    d->refs = 1;
+    d->loading = 1;
+    d->next = ElfBase->dls;
+    ElfBase->dls = d;
     e = oe_load(&f.env, &d->img);
     Close(fh);
+    d->loading = 0;
     if (e != OE_OK) {
         ULONG i;
         note_error(e, &d->img);
+        dl_unlist(d);
         for (i = 0; i < d->ndeps; i++) dl_release(d->deps[i]);
         FreeMem(d, size);
         *err = e;
         return 0;
     }
     CacheClearU();
-    d->refs = 1;
-    d->next = ElfBase->dls;
-    ElfBase->dls = d;
     run_array(d->img.preinit_array, d->img.preinit_count, 0);
     if (d->img.init) ((vfn)d->img.init)();
     run_array(d->img.init_array, d->img.init_count, 0);
@@ -329,11 +343,20 @@ ULONG L_DLOpen(CONST_STRPTR name, ULONG flags)
     return (ULONG)d;
 }
 
+/* A handle's symbol: the object itself, then what it needs, as dlsym
+ * looks (no cycles: dlopen_locked refuses them) */
+static ULONG dl_sym(struct dl *d, CONST_STRPTR name, int depth)
+{
+    ULONG a = oe_lookup(&d->img, name), i;
+    for (i = 0; !a && depth < 8 && i < d->ndeps; i++) a = dl_sym(d->deps[i], name, depth + 1);
+    return a;
+}
+
 ULONG L_DLSym(APTR handle, CONST_STRPTR name)
 {
     ULONG a = 0;
     ObtainSemaphore(&ElfBase->sem);
-    if (handle) a = oe_lookup(&((struct dl *)handle)->img, name);
+    if (handle) a = dl_sym((struct dl *)handle, name, 0);
     else {
         int found = 0;
         a = e_resolve(0, name, &found);
