@@ -14,11 +14,11 @@
  * is not there either the original error goes back unchanged, so whatever
  * the caller tries next (datatypes, a script) still runs.
  *
- * Multicore (OPEN_LIBRARIES.md, section 5): SysBase and DOSBase are set
- * once at init. The shared-object list and the hook are under one
- * semaphore, held for a whole load (a load opens what it needs, and
- * semaphores nest in one task), so loads take turns: the core itself is
- * reentrant, and the list is what they share. */
+ * Multicore (amigachrome-guest's libraries/OPEN_LIBRARIES.md, section 5):
+ * SysBase and DOSBase are set once at init. The shared-object list and the
+ * hook are under one semaphore, held for a whole load (a load opens what it
+ * needs, and semaphores nest in one task), so loads take turns: the core
+ * itself is reentrant, and the list is what they share. */
 #include "openelf_amiga.h"
 #include "elf_core.h"
 #include "openelf_public.h"
