@@ -3,7 +3,7 @@
  * Copyright (c) 2026 AmigaChrome Team. MIT.
  *
  * Plain C with no Amiga headers, so the same file builds into elf.library
- * and into the tests (tests/m68k/test_openelf.sh loads real GCC and LLVM
+ * and into the tests (tests/test_openelf.sh loads real GCC and LLVM
  * output with it under qemu-m68k and runs the loaded code). Written from
  * the System V ABI (ELF), the m68k psABI's relocation list and our own
  * design (README.md); never from another loader's source.

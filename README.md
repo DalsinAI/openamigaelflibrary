@@ -5,7 +5,11 @@ and OpenBench, so what GCC's and LLVM's ELF toolchains build (C, C++ and
 Rust) runs with no conversion to the hunk format. Our own code, MIT, written
 from the System V ABI (ELF), the m68k psABI's relocation list and our own
 design, never from another loader's source (`CLEAN-ROOM.md`). The design and
-its reasons are in the design document (linked from the pull request).
+its reasons are in the design document linked from amigachrome-guest #446.
+
+This repository is `DalsinAI/openamigaelflibrary`. elf.library began in
+`DalsinAI/amigachrome-guest` as `libraries/openelf` (#446, #449) and moved
+here with its history on 23 October 2026.
 
 **Load order** (Dale, 22 October 2026): the Amiga's own hunk format is tried
 first, then ELF; when neither matches, the original error goes back
@@ -26,6 +30,7 @@ runs.
 | `rust/hello` | Rust on AmigaOS: core and alloc, the global allocator on an exec pool (it frees with the size, as FreePooled wants). |
 | `rust/fixture`, `tests/` | The tests' fixtures and `test_core.c`. |
 | `tools/mkhunk.py` | An ELF linked at 0 with `-q` as a one-hunk load file: how elf.library itself and the tools are built. |
+| `tests/test_openelf.sh`, `tests/test_openelf_vamos.sh` | The tests (below), run by `.github/workflows/check-openelf.yml`. |
 | `build-amiga.sh` | The drawer: `Libs/elf.library`, `C/ElfHook`, `C/ElfTest`, `ELF/` examples. Needs only `gcc-m68k-linux-gnu` (and Rust with `rust-src` for `ELF/rust-hello`). 68040, soft float, -Os. |
 
 ## The API
@@ -87,13 +92,13 @@ either.
 
 ## Tests
 
-- `tests/m68k/test_openelf.sh`: the core under qemu-m68k, at -O0 and -Os.
+- `tests/test_openelf.sh`: the core under qemu-m68k, at -O0 and -Os.
   It builds the fixtures (GCC objects, `ld -r`, `-q`, PIE, shared objects
   with `DT_NEEDED`, a Rust object and executable; clang 19 or later when
   present), loads and runs each one, checks every refusal, and loads each
   file cut short and with bytes changed (about 2,500 damaged files) with
   every allocation counted.
-- `tests/m68k/test_openelf_vamos.sh`: the built `elf.library` in amitools'
+- `tests/test_openelf_vamos.sh`: the built `elf.library` in amitools'
   vamos (68040): the examples run from `ElfTest`, `libgreet.so` through
   DLOpen, `greet_answer` found through `libouter.so`, which needs it, a
   cycle of shared objects refused, and a hunk file refused.
